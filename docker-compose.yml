@@ -1,0 +1,24 @@
+services:
+  gateway:
+    build: .
+    container_name: srj-inkbox-gateway
+    env_file: .env
+    # The PC stays on, so the only restarts that matter are crashes and reboots.
+    restart: unless-stopped
+    # No ports section. Inbound arrives down the tunnel's own outbound
+    # connection; publishing the local port would expose the receiver to the
+    # LAN and gain nothing.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      # Hits the local listener the tunnels forward to. A container that is up
+      # but whose uvicorn thread died would otherwise look healthy while
+      # silently 502ing every delivery.
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/healthz').read()"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
