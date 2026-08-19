@@ -27,6 +27,9 @@ once and you have put them in .env. The container needs outbound HTTPS to
 inkbox.ai and outbound Postgres to srj-audit-db. It needs no inbound anything.
 """
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -141,6 +144,156 @@ async def hook(handle: str, request: Request):
         body=f"Inkbox mail to {ident['mailbox']}\nFrom: {sender}\n\n{body_text}",
     )
     log.info("%s: %s %s", handle, "stored" if stored else "duplicate", subject)
+    return {"stored": stored}
+
+
+# Render sends platform events here. The tunnel already gives this container a
+# stable public HTTPS address, so Render can reach it without anything being
+# exposed on the host; the same property that makes the Inkbox path work.
+#
+# WHY ONLY FAILURES REACH THE BRIDGE. A cron that succeeds every day would
+# otherwise write 365 rows a year that say nothing happened, and a bridge full
+# of routine success is a bridge a session stops reading. Successes are logged
+# and dropped. This mirrors the log discipline adopted across the pipeline on
+# 2026-08-18: a row should mean something happened.
+#
+# WHAT THIS CANNOT SEE, and it matters. Render reports the PROCESS EXIT CODE.
+# `pipeline all` deliberately ignores individual stage failures so one bad
+# source cannot block the site build, so a run where six stages failed still
+# exits 0 and arrives here as "succeeded". This endpoint catches the run dying,
+# hanging, or never starting. It does NOT catch a stage failing inside a
+# healthy run; only the pipeline's own run ledger can do that.
+RENDER_EVENTS_TO_BRIDGE = {
+    "cron_job_run_ended",
+    "job_run_ended",
+    "build_ended",
+    "deploy_ended",
+    "server_failed",
+    "server_hardware_failure",
+    "postgres_unavailable",
+    "postgres_backup_failed",
+    "postgres_restore_failed",
+    "postgres_wal_archive_failed",
+    "postgres_read_replica_stale",
+    "pipeline_minutes_exhausted",
+    "image_pull_failed",
+    "branch_deleted",
+}
+
+
+def verify_render(raw: bytes, headers, secret: str) -> bool:
+    """Standard Webhooks signature check.
+
+    The signed string is `{webhook-id}.{webhook-timestamp}.{body}`, HMAC-SHA256
+    under the signing secret, base64 in a `v1,<sig>` header that may carry
+    several space-separated versions during a secret rotation.
+
+    Render's docs render the signed string as ending in `.SIGNING_SECRET`,
+    which reads as concatenation rather than an HMAC key. Rather than guess
+    between the two and fail silently in a retry loop we compute both and
+    accept either, comparing with compare_digest so a wrong signature cannot be
+    distinguished by timing. Belt and braces on a receiver that writes to the
+    bridge is the right trade.
+    """
+    wid = headers.get("webhook-id", "")
+    wts = headers.get("webhook-timestamp", "")
+    sig_header = headers.get("webhook-signature", "")
+    if not (wid and wts and sig_header):
+        return False
+
+    # Reject anything older than five minutes, so a captured delivery cannot be
+    # replayed later.
+    try:
+        if abs(time.time() - int(wts)) > 300:
+            log.warning("render: timestamp outside the 5 minute window")
+            return False
+    except ValueError:
+        return False
+
+    body = raw.decode("utf-8", "replace")
+    key = secret
+    if key.startswith("whsec_"):
+        key = key[len("whsec_"):]
+    try:
+        key_bytes = base64.b64decode(key)
+    except Exception:
+        key_bytes = key.encode()
+
+    candidates = {
+        base64.b64encode(
+            hmac.new(key_bytes, f"{wid}.{wts}.{body}".encode(), hashlib.sha256).digest()
+        ).decode(),
+        base64.b64encode(
+            hmac.new(
+                secret.encode(), f"{wid}.{wts}.{body}".encode(), hashlib.sha256
+            ).digest()
+        ).decode(),
+        base64.b64encode(
+            hashlib.sha256(f"{wid}.{wts}.{body}.{secret}".encode()).digest()
+        ).decode(),
+    }
+    for part in sig_header.split():
+        got = part.split(",", 1)[-1]
+        for want in candidates:
+            if hmac.compare_digest(got, want):
+                return True
+    return False
+
+
+@app.post("/hook/render")
+async def render_hook(request: Request):
+    raw = await request.body()
+    secret = os.environ.get("RENDER_WEBHOOK_SECRET", "")
+    if not secret:
+        log.error("render: no signing secret configured, rejecting")
+        raise HTTPException(status_code=503, detail="receiver not configured")
+    if not verify_render(raw, request.headers, secret):
+        log.warning("render: signature rejected")
+        raise HTTPException(status_code=403, detail="bad signature")
+
+    payload = json.loads(raw)
+    etype = payload.get("type", "")
+    data = payload.get("data") or {}
+    status = data.get("status")
+    service = data.get("serviceName") or data.get("serviceId") or "unknown service"
+
+    # An "ended" event that ended well is not news.
+    if status == "succeeded":
+        log.info("render: %s %s succeeded, not bridging", service, etype)
+        return {"ignored": "succeeded"}
+    if etype not in RENDER_EVENTS_TO_BRIDGE:
+        log.info("render: %s ignored", etype)
+        return {"ignored": etype}
+
+    # webhook-id is stable across Render's eight retries, so the same incident
+    # cannot post twice even if our first 2xx was lost in transit.
+    event_id = request.headers.get("webhook-id") or data.get("id") or ""
+    if not event_id:
+        raise HTTPException(status_code=422, detail="no event id")
+
+    topic = f"Render: {service} {etype}" + (f" ({status})" if status else "")
+    body = (
+        f"Render platform event, delivered to the theworldofai tunnel.\n\n"
+        f"Service: {service}\n"
+        f"Event: {etype}\n"
+        f"Status: {status or 'n/a'}\n"
+        f"Occurred: {payload.get('timestamp', 'unknown')}\n"
+        f"Event id: {data.get('id', event_id)}\n\n"
+        "Fetch the full detail from the Render API Retrieve event endpoint with "
+        "that event id, and read the run log in the dashboard before drawing a "
+        "conclusion: this payload is deliberately thin and says only that "
+        "something ended badly, not why.\n\n"
+        "IMPORTANT: for srj-pipeline, a 'succeeded' run does NOT mean every "
+        "stage worked. The daily sequence ignores individual stage failures so "
+        "one bad source cannot block the site build. This alert catches the run "
+        "dying or never starting; it cannot catch a stage failing inside a "
+        "healthy run."
+    )
+    stored = record(
+        kind="render", external_id=str(event_id), project="theworldofai",
+        topic=topic, body=body,
+    )
+    log.info("render: %s %s %s", "stored" if stored else "duplicate", service, etype)
     return {"stored": stored}
 
 
